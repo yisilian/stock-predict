@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import time
 import urllib.request
 from datetime import datetime, timedelta
@@ -438,6 +439,38 @@ def resolve_stock_input(text: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+MAX_STOCKS_COMPARE = 10
+
+
+def parse_stock_inputs(text: str, max_count: int = MAX_STOCKS_COMPARE) -> Tuple[List[str], List[str]]:
+    """
+    解析多只股票输入，支持逗号/空格/换行分隔。
+    返回: (codes, 无法识别的片段列表)
+    """
+    if not text or not text.strip():
+        return [], []
+    parts = [p.strip() for p in re.split(r"[,，\s\n/;；]+", text.strip()) if p.strip()]
+    codes: List[str] = []
+    errors: List[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        if len(codes) >= max_count:
+            errors.append(f"已达上限 {max_count} 只，其余已忽略")
+            break
+        code = resolve_stock_input(part)
+        if not code:
+            digits = "".join(c for c in part if c.isdigit())
+            if len(digits) == 6:
+                code = digits
+        if code and len(code) == 6:
+            if code not in seen:
+                seen.add(code)
+                codes.append(code)
+        else:
+            errors.append(part)
+    return codes, errors
 
 
 def query(code: str, data_type: str = "quote") -> Any:

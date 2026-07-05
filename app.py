@@ -6,9 +6,11 @@ app.py — Stock Predict 尾盘选股 Streamlit 网页
 
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import pandas as pd
 import streamlit as st
 
 
@@ -26,60 +28,29 @@ def _inject_streamlit_secrets() -> None:
 
 _inject_streamlit_secrets()
 
-from astock_data import IS_CI, has_tushare_token, get_minute_data, resolve_stock_input
+from astock_data import (
+    IS_CI,
+    MAX_STOCKS_COMPARE,
+    has_tushare_token,
+    parse_stock_inputs,
+    resolve_stock_input,
+)
 from tail_pick import analyze_stock
 
-st.set_page_config(
-    page_title="尾盘选股分析",
-    page_icon="📈",
-    layout="centered",
-)
+VERDICT_SHORT = {
+    "🟢 强烈推荐": "🟢 强烈推荐",
+    "🟡 可以考虑": "🟡 可以考虑",
+    "🟡 形态偏多": "🟡 形态偏多",
+    "🔴 建议回避": "🔴 建议回避",
+    "⚪ 中性偏强": "⚪ 中性偏强",
+    "⚪ 暂不建议": "⚪ 暂不建议",
+}
 
-st.title("尾盘选股分析")
-st.caption("基于尾盘分时形态 + 三步筛选，评估次日走势倾向（规则分析，非机器学习预测）")
 
-with st.sidebar:
-    st.markdown("### 数据环境")
-    st.write(f"- CI 模式: {'是' if IS_CI else '否'}")
-    if has_tushare_token():
-        st.write("- Tushare: ✅ 已配置")
-    else:
-        st.write("- Tushare: ❌ 未配置")
-        st.caption(
-            "请在 [Streamlit Cloud](https://share.streamlit.io) → 本 App → "
-            "**Settings → Secrets** 添加 `TUSHARE_TOKEN`。"
-            "GitHub Actions 里的 Secret **不会**同步到这里。"
-        )
-    st.info("14:30 后运行效果最佳。结论仅供参考，不构成投资建议。")
-
-col1, col2 = st.columns([3, 1])
-with col1:
-    user_input = st.text_input(
-        "股票代码或名称",
-        placeholder="例如 600519 或 贵州茅台",
-        label_visibility="collapsed",
-    )
-with col2:
-    run = st.button("分析", type="primary", use_container_width=True)
-
-if run:
-    if not user_input.strip():
-        st.warning("请输入股票代码或名称")
-        st.stop()
-
-    code = resolve_stock_input(user_input) or user_input.strip()
-    code = "".join(c for c in code if c.isdigit())
-    if len(code) != 6:
-        st.error(f"无法识别股票「{user_input}」，请输入 6 位 A 股代码")
-        st.stop()
-
-    with st.spinner(f"正在分析 {code} …"):
-        result = analyze_stock(code)
-        _, minute_src = get_minute_data(code)
-
+def _render_single(result: dict) -> None:
     if result.get("error"):
         st.error(result["error"])
-        st.stop()
+        return
 
     q = result.get("quote", {})
     p = result.get("pattern", {})
@@ -89,8 +60,7 @@ if run:
     st.markdown(f"## {result.get('verdict', '')}")
     st.markdown(
         f"**{result['code']} {result.get('name', '')}** · "
-        f"综合 **{s.get('final_score', 0)}/100** · "
-        f"数据: 分钟线 `{minute_src}`"
+        f"综合 **{s.get('final_score', 0)}/100**"
     )
 
     m1, m2, m3, m4 = st.columns(4)
@@ -116,6 +86,170 @@ if run:
     st.markdown("### 操作建议")
     st.write(result.get("recommendation", ""))
     st.caption(f"分析耗时 {s.get('elapsed_seconds', 0)}s · {result.get('timestamp', '')}")
+
+
+def _results_to_dataframe(results: list) -> pd.DataFrame:
+    rows = []
+    for r in results:
+        if r.get("error"):
+            rows.append({
+                "代码": r.get("code", ""),
+                "名称": "—",
+                "现价": None,
+                "涨幅%": None,
+                "量比": None,
+                "换手%": None,
+                "市值(亿)": None,
+                "形态": r.get("error", "")[:20],
+                "形态分": None,
+                "综合分": None,
+                "建议": "❌ 失败",
+            })
+            continue
+        q = r.get("quote", {})
+        p = r.get("pattern", {})
+        s = r.get("summary", {})
+        rows.append({
+            "代码": r["code"],
+            "名称": r.get("name", ""),
+            "现价": q.get("price", 0),
+            "涨幅%": q.get("change_pct", 0),
+            "量比": q.get("volume_ratio", 0),
+            "换手%": q.get("turnover_rate", 0),
+            "市值(亿)": q.get("circ_mcap_yi", 0),
+            "形态": p.get("pattern_name", ""),
+            "形态分": p.get("score", 0),
+            "综合分": s.get("final_score", 0),
+            "建议": VERDICT_SHORT.get(r.get("verdict", ""), r.get("verdict", "")),
+        })
+    df = pd.DataFrame(rows)
+    if "综合分" in df.columns and not df["综合分"].isna().all():
+        df = df.sort_values("综合分", ascending=False, na_position="last")
+    return df.reset_index(drop=True)
+
+
+def _render_compare(results: list) -> None:
+    ok = [r for r in results if not r.get("error")]
+    buy = sum(1 for r in ok if "🟢" in r.get("verdict", ""))
+    maybe = sum(1 for r in ok if "🟡" in r.get("verdict", ""))
+    avoid = sum(1 for r in ok if "🔴" in r.get("verdict", ""))
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("分析数量", len(results))
+    c2.metric("🟢 推荐", buy)
+    c3.metric("🟡 关注", maybe)
+    c4.metric("🔴 回避", avoid)
+
+    st.markdown("### 对比总览（按综合分排序）")
+    st.dataframe(
+        _results_to_dataframe(results),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if ok:
+        best = max(ok, key=lambda r: r.get("summary", {}).get("final_score", 0))
+        st.success(
+            f"综合最高：**{best['code']} {best.get('name', '')}** "
+            f"({best.get('summary', {}).get('final_score', 0)} 分) · {best.get('verdict', '')}"
+        )
+
+    st.markdown("### 个股详情")
+    for r in sorted(
+        results,
+        key=lambda x: x.get("summary", {}).get("final_score", 0) or -1,
+        reverse=True,
+    ):
+        label = f"{r.get('code', '?')} {r.get('name', r.get('code', ''))} · {r.get('verdict', '❌')}"
+        with st.expander(label, expanded=len(results) <= 3):
+            _render_single(r)
+
+
+def _analyze_batch(codes: list, progress_bar) -> list:
+    results = []
+    n = len(codes)
+    for i, code in enumerate(codes):
+        results.append(analyze_stock(code))
+        progress_bar.progress((i + 1) / n, text=f"已完成 {i + 1}/{n}：{code}")
+        if i < n - 1:
+            time.sleep(0.6)
+    return results
+
+
+st.set_page_config(
+    page_title="尾盘选股分析",
+    page_icon="📈",
+    layout="wide",
+)
+
+st.title("尾盘选股分析")
+st.caption("基于尾盘分时形态 + 三步筛选，评估次日走势倾向（规则分析，非机器学习预测）")
+
+with st.sidebar:
+    st.markdown("### 数据环境")
+    st.write(f"- CI 模式: {'是' if IS_CI else '否'}")
+    if has_tushare_token():
+        st.write("- Tushare: ✅ 已配置")
+    else:
+        st.write("- Tushare: ❌ 未配置")
+        st.caption(
+            "请在 Streamlit Cloud → App → **Settings → Secrets** 添加 `TUSHARE_TOKEN`。"
+        )
+    st.info("14:30 后运行效果最佳。结论仅供参考，不构成投资建议。")
+    st.markdown(f"多股对比最多 **{MAX_STOCKS_COMPARE}** 只")
+
+tab_single, tab_compare = st.tabs(["单股分析", "多股对比"])
+
+with tab_single:
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        single_input = st.text_input(
+            "股票代码或名称",
+            placeholder="例如 600519 或 贵州茅台",
+            key="single_input",
+            label_visibility="collapsed",
+        )
+    with col2:
+        run_single = st.button("分析", type="primary", use_container_width=True, key="run_single")
+
+    if run_single:
+        if not single_input.strip():
+            st.warning("请输入股票代码或名称")
+        else:
+            code = resolve_stock_input(single_input) or single_input.strip()
+            code = "".join(c for c in code if c.isdigit())
+            if len(code) != 6:
+                st.error(f"无法识别「{single_input}」，请输入 6 位 A 股代码")
+            else:
+                with st.spinner(f"正在分析 {code} …"):
+                    _render_single(analyze_stock(code))
+
+with tab_compare:
+    compare_input = st.text_area(
+        "输入多只股票（逗号、空格或换行分隔）",
+        placeholder="600519, 000858, 002008\n贵州茅台",
+        height=100,
+        key="compare_input",
+    )
+    run_compare = st.button("开始对比", type="primary", key="run_compare")
+
+    if run_compare:
+        if not compare_input.strip():
+            st.warning("请输入至少一只股票")
+        else:
+            codes, parse_errors = parse_stock_inputs(compare_input)
+            if parse_errors:
+                st.warning("以下输入无法识别，已跳过：" + "、".join(parse_errors))
+            if not codes:
+                st.error("没有有效的 6 位股票代码")
+            elif len(codes) == 1:
+                with st.spinner(f"正在分析 {codes[0]} …"):
+                    _render_single(analyze_stock(codes[0]))
+            else:
+                progress = st.progress(0, text="准备分析…")
+                results = _analyze_batch(codes, progress)
+                progress.empty()
+                _render_compare(results)
 
 st.markdown("---")
 st.caption(
