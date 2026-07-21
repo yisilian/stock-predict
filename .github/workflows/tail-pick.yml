@@ -6,10 +6,14 @@ on:
     - cron: "35 6 * * 1-5"
   workflow_dispatch:
     inputs:
-      codes:
-        description: "股票代码，空格分隔（留空则用 watchlist.txt）"
+      mode:
+        description: "watchlist=分析固定清单；scan=全市场扫描只推buy候选"
         required: false
-        default: ""
+        default: "watchlist"
+        type: choice
+        options:
+          - watchlist
+          - scan
 
 jobs:
   analyze:
@@ -30,14 +34,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run tail pick analysis
-        run: |
-          CODES="${{ github.event.inputs.codes }}"
-          if [ -n "$CODES" ]; then
-            python tail_pick.py $CODES
-          else
-            python tail_pick.py --list watchlist.txt
-          fi
+      - name: Scan market (buy candidates only)
+        if: ${{ github.event.inputs.mode == 'scan' }}
+        run: python scan_market.py
+
+      - name: Analyze watchlist
+        if: ${{ github.event.inputs.mode != 'scan' }}
+        run: python tail_pick.py --list watchlist.txt
 
       - name: Push result to Feishu
         if: always()
